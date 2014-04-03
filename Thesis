@@ -1,0 +1,128 @@
+require(parallel)
+# At home 
+#setwd("C:/Users/Admin/Desktop/University stuff/Thesis/Programs")
+data<-read.csv('k610ern_clean.csv',colClasses='factor')
+ptm<-proc.time()#First sort the dataset
+data[with(data,order(k610ern))]
+
+comb<-combn(colnames(data[-1]),2)
+
+
+deviancedif<-function(x,y){
+	x<-eval(parse(text=paste("data$",x)))
+	y<-eval(parse(text=paste("data$",y)))	
+	glm1<-glm(k610ern~x+y,family=binomial,data=data)
+	glm2<-glm(k610ern~x+y+x:y,family=binomial,data=data)
+	z<-anova(glm1,glm2,test="LRT")
+	deviancediff<-z[2,4]
+	p.value<-z[2,5]
+	return(as.vector(c(deviancediff,p.value)))
+}
+
+
+z<-mclapply(seq_len(ncol(comb)), function(f) do.call(deviancedif,as.list(comb[,f])))
+result.matrix<-matrix(unlist(z),ncol=2,byrow=T)
+result<-data.frame(Covariate1=comb[1,],Covariate2=comb[2,],deviance_difference=result.matrix[,1],p.value=result.matrix[,2])
+results<-subset(result,p.value<0.05)
+write.table(results,file="results",sep=" ",row.names=F)
+proc.time() -ptm
+
+
+
+
+
+#Create Wbit matrix
+wbit<-function(data_set_name){
+  cnames<-colnames(data_set_name)[-1]
+  #Create bit string for each level
+  cbits<-function(c,data_set_name){  
+    c_bit<-eval(parse(text=paste(deparse(substitute(data_set_name)),"$",c)))
+    nc_bit<-nlevels(c_bit)
+    m.cbits<-matrix(0,3,dim(data_set_name)[1])
+    for (i in 1:3){
+      logicalvector<-c_bit==(i-1)
+      m.cbits[i,]<-as.numeric(logicalvector)
+    }
+    return(m.cbits)
+  }
+  wbitlist<-lapply(cnames,cbits,data_set_name)
+  wbit<-do.call(rbind, wbitlist)
+  return(wbit)
+}
+
+#To save calculations later on we will just program for our particular data set and calculate wbit once here.
+wbit<-wbit(data)
+
+#function that calls the SNP sub matrix, for efficiency reasons assume wbit has already been calculated
+cnames<-colnames(data)[-1]
+#SNP1<-cnames[1]
+#SNP2<-cnames[2]
+
+
+
+# Now we calculate the frequency, there should be 3*3*2 values to calculate (assume 
+# each SNP has exactly 3 levels, adjustments will be made later).
+BOOST<-function(SNP1,SNP2,dsn=wbit,names=cnames){
+  l.SNP1<-nlevels(eval(parse(text=paste("data$",SNP1))))
+  l.SNP2<-nlevels(eval(parse(text=paste("data$",SNP2))))
+  combination.df<-expand.grid(k610ern=0:1,SNP1=0:(l.SNP1-1),SNP2=0:(l.SNP2-1))
+  colnames( combination.df)<-c('k610ern',SNP1,SNP2)
+  pSNP1<-which(names==SNP1)
+  pSNP2<-which(names==SNP2) 
+  r.SNP1<-3*pSNP1-2
+  r.SNP2<-3*pSNP2-2
+  control<-dsn[c(r.SNP1:(r.SNP1+2),r.SNP2:(r.SNP2+2)),1:190]
+  case<-dsn[c(r.SNP1:(r.SNP1+2),r.SNP2:(r.SNP2+2)),191:229]    
+  freq.control<-matrix(mapply(function(i,j)sum(ifelse(control[i,]==control[j,]&control[i,]==1,1,0)),sort(rep(1:l.SNP1,l.SNP2)),rep(4:(4+l.SNP2-1),l.SNP1)),nrow=l.SNP1,ncol=l.SNP2,byrow=T)  
+  freq.case<-matrix(mapply(function(i,j)sum(ifelse(case[i,]==case[j,]&case[i,]==1,1,0)),sort(rep(1:l.SNP1,l.SNP2)),rep(4:(4+l.SNP2-1),l.SNP1)),nrow=l.SNP1,ncol=l.SNP2,byrow=T)  
+  
+  #Now we calculate the total frequency, the ith element represent the total freq for i-1 level
+  control.tf.SNP1<-rowSums(freq.control)
+  case.tf.SNP1<-rowSums(freq.case)
+  tf.SNP1<-control.tf.SNP1+ case.tf.SNP1
+  control.tf.SNP2<-colSums(freq.control)
+  case.tf.SNP2<-colSums(freq.case)
+  tf.SNP2<-control.tf.SNP2+ case.tf.SNP2
+  tf.p<-as.vector(c(sum(freq.control),sum(freq.case)))
+  freq.combined<-freq.control+freq.case
+  
+  #Function for unscaled KSA for control
+  f.KSA.control<-function(i,j){freq.combined[i,j]*control.tf.SNP1[i]*control.tf.SNP2[j]/(tf.SNP1[i]*tf.SNP2[j]*tf.p[1])}
+  f.KSA.case<-function(i,j){freq.combined[i,j]*case.tf.SNP1[i]*case.tf.SNP2[j]/(tf.SNP1[i]*tf.SNP2[j]*tf.p[2])}
+  KSA.control<-matrix(mapply(f.KSA.control,row(freq.control),col(freq.control)),dim(freq.control)[1])
+  KSA.case<-matrix(mapply(f.KSA.case,row(freq.case),col(freq.case)),dim(freq.case)[1])
+  KSA.unorm<-do.call(cbind,list(KSA.control,KSA.case))
+  Freq.unscaled<-do.call(cbind,list(freq.control,freq.case))
+  scale.KSA<-sum(KSA.unorm)
+  KSA<-KSA.unorm/scale.KSA
+  n<-sum(Freq.unscaled)
+  Freq.scaled<-Freq.unscaled/n
+  
+  KLD<-sum(Freq.scaled*log(Freq.scaled/KSA),na.rm=TRUE)
+  Est<-2*n*KLD
+  degreesfreedom<-(l.SNP1-1)*(l.SNP2-1)
+  return(as.vector(c(Est,degreesfreedom)))
+}
+
+p.eval<-function(Deviance,degreesfreedom,pvalue){
+  p.dev<-pchisq(SNP1,SNP2,q=Deviance,df=degreesfreedom,lower.tail=FALSE)
+  if (p.dev>pvalue){
+    return(do.call(deviancedif,as.list(c(SNP1,SNP2))))
+  } else{return(-1)
+    
+  }
+}
+
+y<-mclapply(seq_len(ncol(comb)), function(f) do.call(BOOST,as.list(comb[,f])))
+result.matrix<-matrix(unlist(y),ncol=2,byrow=T)
+result.BOOST<-data.frame(Covariate1=comb[1,],Covariate2=comb[2,],deviance_difference=result.matrix[,1],p.value=result.matrix[,2])
+
+write.table(results,file="results",sep=" ",row.names=F)
+
+
+MAF<-function(x){
+  x<-eval(parse(text=paste("data$",x)))
+  aa<-sum(x==0)
+  AA<-sum(x==2)
+  return(ifelse(aa<AA, sum(x==0|x==1),sum(x==1|x==2))
+}
